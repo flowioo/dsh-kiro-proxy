@@ -399,6 +399,34 @@ eq(finishPayload.usage.completion_tokens, 30, 'usage.completion_tokens = outputT
 eq(finishPayload.usage.total_tokens, 150, 'usage.total_tokens 是两者之和')
 eq(finishPayload.usage.prompt_tokens_details.cached_tokens, 64, 'prompt_tokens_details.cached_tokens = cacheReadTokens')
 
+// ===========================================================================
+log('')
+log('== 2b. 没测到的 token 数要标成 estimated ==')
+
+// 运行时那条通道报的是 credits 而不是 token 数，所以 usage 事件里的 token
+// 是 0 —— 那是"没测到"，不是"测到 0"。这个区别必须让客户端看得见，
+// 否则 0 会被当成一次真实的测量。
+{
+  const state = newOpenAiState({ id: 'chatcmpl-est', model: 'm', created: 1700000000 })
+  const estimatedEvents = [
+    { kind: 'text', text: 'hi' },
+    { kind: 'usage', inputTokens: 0, outputTokens: 0, estimated: true, credits: 0.0115, creditsUnit: 'credit' },
+  ]
+  for (const evt of estimatedEvents) wireToOpenAiChunk(evt, state)
+  const finish = JSON.parse(wireFinish(state, 'END_TURN'))
+  eq(finish.usage.kiro_estimated, true, 'OpenAI usage 带 kiro_estimated')
+  eq(finish.usage.kiro_credits, 0.0115, 'OpenAI usage 带 kiro_credits')
+  eq(finish.usage.prompt_tokens, 0, '没测到的输入 token 是 0')
+
+  const anthropicState = newAnthropicState({ id: 'msg-est', model: 'm' })
+  for (const evt of estimatedEvents) wireToAnthropicEvent(evt, anthropicState)
+  const stopFrames = anthropicStop(anthropicState, 'END_TURN')
+  const delta = stopFrames.find(frame => frame.event === 'message_delta')
+  const deltaUsage = JSON.parse(delta.data).usage
+  eq(deltaUsage.kiro_estimated, true, 'Anthropic usage 带 kiro_estimated')
+  eq(deltaUsage.kiro_credits, 0.0115, 'Anthropic usage 带 kiro_credits')
+}
+
 const finalResponse = wireToOpenAiResponse(openAiState)
 eq(finalResponse.object, 'chat.completion', '非流式 object')
 eq(finalResponse.choices[0].message.content, 'Hello world', '非流式 message.content')

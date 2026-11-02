@@ -105,8 +105,10 @@ continue.","reason":"INVALID_MODEL_ID"}`。所以模型选择器里给出的每�
   它只影响**展示名**：`KIRO_CLI` 的 `modelName` 是 null（名字退回 id），
   `AI_EDITOR` 给的是 `"GPT 5.6 Sol"` 这样的友好名；两者的模型集合完全一致。
 - `profileArn` 对 IdC 账号必填，缺了回 `400 {"message":"Invalid profileArn."}`；
-  没有 ARN 的账号（个人 Builder 登录）没有账号目录，用全局目录——对那个账号来说
-  全局目录就是对的。
+  没有 ARN 的账号没有账号目录，用全局目录——对那个账号来说全局目录就是对的。
+- **只有企业账号才问管理面。** 分界是认证方式（`idc` / `external_idp`），不是有没有
+  ARN：插件对任何非 api_key 凭据都会去发现 ARN，个人账号照样拿得到一个。光看 ARN
+  会让个人账号的模型列表被管理面那份悄悄换掉，所以门禁必须落在认证方式上。
 - 区域取自 profile ARN（`arn:aws:codewhisperer:us-east-1:…` -> `us-east-1`），
   不是 token 自己带的区域。
 - 头就是常规 Kiro 头：`Authorization: Bearer <token>`、企业账号的 CLI user-agent、
@@ -114,6 +116,8 @@ continue.","reason":"INVALID_MODEL_ID"}`。所以模型选择器里给出的每�
 - 响应体与 CodeWhisperer 那份同形（`models[].modelId / modelName / description /
   tokenLimits / supportedInputTypes / additionalModelRequestFieldsSchema / …`，
   另有 `defaultModel`），所以 `parseModelPage()` 原样解析。
+- 同样分页：`maxResults` + `nextToken` 都收（实测 `maxResults=1` 会回
+  `nextToken`），所以请求带上 `maxResults`，并跟着 `nextToken` 翻完页。
 
 **退回规则**：账号目录拿不到时（非 200、抛错、响应没有 `models` 数组、空目录、
 没有 profileArn）一律退回全局目录，模型列表不因此失败；两个目录都失败才报错。
@@ -127,14 +131,17 @@ continue.","reason":"INVALID_MODEL_ID"}`。所以模型选择器里给出的每�
 ```
 {
   model, input, profileArn, origin: 'KIRO_CLI', stream: true,
-  metadata: { 'kiro:agent_mode': 'vibe', 'kiro:conversation_id': <id>, 'kiro:root_conversation_id': <id> }
+  metadata: { 'kiro:agent_mode': 'vibe', 'kiro:conversation_id': <id>, 'kiro:root_conversation_id': <id> },
+  tools?: [{ type: 'function', name, description, parameters }]   # 有工具规格时才发
 }
 ```
 
 - 缺 `profileArn` -> `profileArn is required for this request.`
 - 缺 `stream` -> `Non-streaming responses are not supported for this request. Please set stream=true.`
 - 缺 `origin` -> `origin is required unless the request carries the Kiro Reasoning service principal`
-- 模型 id 不被接受 -> `Invalid model ID: <id>`，`code: model_not_found`
+- 模型 id 不被接受 -> `Invalid model ID: <id>`，`code: model_not_found`。
+  运行时把这个失败包在 `{"error":{"code":…,"message":…}}` 里（顶层是空的），
+  所以探测要往信封里读 `code` / `message`，只读顶层会读不出来。
 - 发 `instructions` -> `systemPrompt field is not enabled for this user.`（param `instructions`）
   ——**永远不发**，系统提示词走第一条 user 轮
 - 发 `tool_choice` -> `This request contains parameters or input that are not supported.`
@@ -167,7 +174,9 @@ TokenType: SSO_OIDC                    # IdC；external_idp -> EXTERNAL_IDP，ap
 ```
 
 所以这条通道上 token 用量是 0，插件不编数字：usage 事件标成 `estimated: true`
-（"没测到"而不是"测到 0"），并把真正测到的 credits 带出去。
+（"没测到"而不是"测到 0"），并把真正测到的 credits 带出去。这个标记一路带到
+两个协议面：OpenAI 的 usage 里是 `kiro_estimated: true`，Anthropic 的 usage 里同样，
+和 `kiro_credits` / `kiro_credits_unit` 并排。
 
 **状态：请求契约与 usage 形状是实测的；响应事件名是按 OpenAI Responses 的公开形状
 实现的，没有对活服务验证过。** 默认关闭（`chatTransport` 默认 `aws`）。

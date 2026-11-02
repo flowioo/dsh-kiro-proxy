@@ -358,6 +358,69 @@ function sseStream(blocks) {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. 嵌套的 error 信封也要能触发候选探测
+//
+// 运行时把失败包在 {"error":{"code":…,"message":…}} 里，顶层是空的。
+// 只读顶层的话，这个失败读出来就是一句 "HTTP 400"，探测根本不会触发，
+// 于是模型 id 明明有候选也不会试。
+// ---------------------------------------------------------------------------
+{
+  const sentModels = []
+  const client = new KiroClient({
+    options: () => ({ chatTransport: 'kiro-runtime', modelIdProbe: ['CAND_A'] }),
+    store: {
+      directory: 'unused',
+      active: async () => ({
+        credential: {
+          accessToken: 'aoa_runtime_nested',
+          method: 'idc',
+          region: 'us-east-1',
+          expiresAt: Date.now() + 3_600_000,
+          profileArn: ARN,
+        },
+        id: 'a',
+        label: 'A',
+      }),
+      read: async () => ({ accounts: [], activeId: null }),
+      describe: async () => ({ activeId: null, accounts: [] }),
+      clear: async () => {},
+    },
+    post: async request => {
+      const body = JSON.parse(request.body)
+      sentModels.push(body.model)
+      if (body.model === 'CAND_A') {
+        return {
+          status: 200,
+          headers: {},
+          body: sseStream([
+            'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"好"}',
+            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}',
+          ]),
+        }
+      }
+      return {
+        status: 400,
+        headers: {},
+        body: sseStream([Buffer.from(JSON.stringify({
+          error: { message: `Invalid model ID: ${body.model}`, code: 'model_not_found' },
+        }), 'utf8')]),
+      }
+    },
+    sleep: async () => {},
+  })
+  const events = []
+  for await (const event of client.sendWire({
+    conversationState: {
+      currentMessage: { userInputMessage: { content: 'hi', modelId: 'm1', origin: 'KIRO_CLI' } },
+    },
+  }, new AbortController().signal, { requestedModelId: 'claude-opus-5.5' })) events.push(event)
+  check('嵌套 error 信封也会触发候选探测',
+    sentModels.join(',') === 'm1,CAND_A', sentModels.join(','))
+  check('嵌套 error 信封探测成功后拿到正文',
+    events.some(event => event.kind === 'text' && event.text === '好'), JSON.stringify(events))
+}
+
+// ---------------------------------------------------------------------------
 // 6. 运行时的 usage 是 credits，不是 token 数
 // ---------------------------------------------------------------------------
 {

@@ -70,10 +70,15 @@ const GLOBAL_PAGE = {
 
 /**
  * 造一个 client：getJson 按 URL 分流到管理面 / CodeWhisperer 两份目录。
- * @param {object} spec - `{ credential, options, management, global }`。
+ *
+ * postJson 也必须钉住：没有 ARN 的账号要走 profile 发现，而发现走的是
+ * postJson（ListAvailableProfiles）。不钉它，这个用例会真的发一次网络请求
+ * —— 断言"个人账号不打扰管理面"就只因为外网不通才成立，那是环境的性质，
+ * 不是代码的性质。
+ * @param {object} spec - `{ credential, options, management, global, profiles }`。
  */
 function buildClient(spec) {
-  const calls = { getJson: [] }
+  const calls = { getJson: [], postJson: [] }
   const client = new KiroClient({
     options: () => spec.options ?? {},
     store: {
@@ -90,6 +95,11 @@ function buildClient(spec) {
       if (page === undefined) return { status: 404, body: { message: 'not scripted' } }
       if (typeof page === 'function') return page(url, headers)
       return page
+    },
+    postJson: async (url, body, headers) => {
+      calls.postJson.push({ url, body, headers })
+      if (spec.profiles === undefined) return { status: 403, body: { message: 'not scripted' } }
+      return { status: 200, body: { profiles: spec.profiles } }
     },
     sleep: async () => {},
   })
@@ -114,6 +124,21 @@ const socialCredential = (token = 'aoa_catalog_social') => ({
   method: 'social',
   region: 'us-east-1',
   expiresAt: Date.now() + 3_600_000,
+})
+
+/**
+ * 个人凭据，但 ARN 已经发现了。
+ *
+ * 插件对任何非 api_key 凭据都会去发现 ARN，个人账号也拿得到一个。所以
+ * "有没有 ARN" 分不出企业账号和个人账号，真正的分界是认证方式。
+ * @param {string} token - accessToken；每个用例必须不同。
+ */
+const socialCredentialWithArn = (token = 'aoa_catalog_social_arn') => ({
+  accessToken: token,
+  method: 'social',
+  region: 'us-east-1',
+  expiresAt: Date.now() + 3_600_000,
+  profileArn: ARN,
 })
 
 // ---------------------------------------------------------------------------
@@ -174,6 +199,43 @@ const socialCredential = (token = 'aoa_catalog_social') => ({
 }
 
 // ---------------------------------------------------------------------------
+// 2b. 管理面目录分页：授予的模型超过一页时不能被静默截断
+// ---------------------------------------------------------------------------
+{
+  const pages = [
+    {
+      status: 200,
+      body: {
+        models: [{ modelId: 'gpt-5.6-sol', modelName: 'GPT 5.6 Sol' }],
+        nextToken: 'MQ==',
+      },
+    },
+    {
+      status: 200,
+      body: {
+        models: [{ modelId: 'glm-5', modelName: 'GLM 5' }],
+      },
+    },
+  ]
+  const { client, calls } = buildClient({
+    credential: idcCredential('aoa_paged'),
+    management: () => pages.shift(),
+    global: GLOBAL_PAGE,
+  })
+  const models = await client.models()
+  check('管理面目录翻页后拿到全部模型',
+    models.map(model => model.id).join(',') === 'gpt-5.6-sol,glm-5',
+    models.map(model => model.id).join(','))
+  check('管理面目录翻页打了两次请求', calls.getJson.length === 2, String(calls.getJson.length))
+  check('第二页带上了 nextToken',
+    new URL(calls.getJson[1]?.url ?? 'https://x/').searchParams.get('nextToken') === 'MQ==',
+    calls.getJson[1]?.url)
+  check('管理面目录请求带 maxResults',
+    new URL(calls.getJson[0]?.url ?? 'https://x/').searchParams.get('maxResults') === '50',
+    calls.getJson[0]?.url)
+}
+
+// ---------------------------------------------------------------------------
 // 3. 没有 profile ARN 的账号没有账号目录：用全量目录
 // ---------------------------------------------------------------------------
 {
@@ -190,6 +252,32 @@ const socialCredential = (token = 'aoa_catalog_social') => ({
   check('个人账号打的是 CodeWhisperer 目录端点',
     calls.getJson[0]?.url.startsWith('https://q.us-east-1.amazonaws.com/ListAvailableModels'),
     calls.getJson[0]?.url)
+}
+
+// ---------------------------------------------------------------------------
+// 3b. 个人账号即使带着 ARN 也不许被管理面目录接管
+//
+// 插件对任何非 api_key 凭据都会去发现 ARN，个人账号照样拿得到一个。所以
+// "有没有 ARN" 分不出企业账号和个人账号——按 ARN 判断会让个人账号的模型
+// 列表被管理面那份悄悄换掉。分界必须是认证方式。
+// ---------------------------------------------------------------------------
+{
+  const { client, calls } = buildClient({
+    credential: socialCredentialWithArn('aoa_social_with_arn'),
+    management: ACCOUNT_PAGE,
+    global: GLOBAL_PAGE,
+  })
+  const models = await client.models()
+  check('带 ARN 的个人账号仍拿到 CodeWhisperer 目录',
+    models.map(model => model.id).join(',') === 'claude-opus-5.5,gpt-5.6-sol,glm-5',
+    models.map(model => model.id).join(','))
+  check('带 ARN 的个人账号不被打扰管理面', calls.getJson.length === 1, String(calls.getJson.length))
+  check('带 ARN 的个人账号打的是 CodeWhisperer 目录端点',
+    calls.getJson[0]?.url.startsWith('https://q.us-east-1.amazonaws.com/ListAvailableModels'),
+    calls.getJson[0]?.url)
+  check('带 ARN 的个人账号一次管理面请求都没有',
+    calls.getJson.every(call => !call.url.includes('management.')),
+    calls.getJson.map(call => call.url).join(' | '))
 }
 
 // ---------------------------------------------------------------------------

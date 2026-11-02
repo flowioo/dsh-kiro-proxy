@@ -85,7 +85,7 @@ Enterprise accounts are served by a different data plane than personal ones, and
    GET https://management.<region>.kiro.dev/ListAvailableModels?origin=AI_EDITOR&profileArn=<arn>
    ```
 
-   `origin` and `profileArn` are both required, and the region comes from the profile ARN. The response has the same shape as the CodeWhisperer one, and its `modelId` **is** the id the data plane accepts — there is no alias to translate. The plugin asks this catalog first and falls back to the public one only when there is no account catalog to ask (no profile ARN) or the management plane refuses or fails.
+   `origin` and `profileArn` are both required, and the region comes from the profile ARN. The response has the same shape as the CodeWhisperer one, and its `modelId` **is** the id the data plane accepts — there is no alias to translate. The plugin asks this catalog first for an **enterprise** account (`idc` / `external_idp`), and falls back to the public one when the management plane refuses or fails. A personal login is never asked: for that account the global catalog *is* the right list. The gate is the auth method, not the presence of a profile ARN — the plugin discovers an ARN for personal logins too, so an ARN on its own does not make an account enterprise.
 
    Measured on an enterprise account: the management plane lists 8 models (`gpt-5.6-sol` as the default, `gpt-5.6-terra`, `gpt-5.6-luna`, `deepseek-3.2`, `minimax-m2.5`, `minimax-m2.1`, `glm-5`, `qwen3-coder-next`), while the global catalog lists 21 — those 8 plus `auto` and the entire Claude family, none of which the account is entitled to.
 
@@ -118,8 +118,8 @@ CodeWhisperer eventstream. Its request contract is measured:
 - the reply's `usage` is **credits, not tokens**
   (`{"kiro:credits":{"value":0.0115,"unit":"credit"},"kiro:context_usage_percentage":0.119}`),
   so token usage on that path is unknown. The plugin reports it as *not measured*
-  (`estimated: true`) and carries the credits through, instead of passing zeros
-  off as a measurement.
+  (`kiro_estimated: true` in the usage payload, alongside the credits it did
+  measure) instead of passing zeros off as a measurement.
 
 ## Using it outside the Harness
 
@@ -207,13 +207,13 @@ An empty turn therefore triggers the fallback chain instead of failing the turn;
 Offline suites, run them all with `npm test` (`tests/run-all.mjs`); everything except the `live-*` probes runs without credentials or a Host:
 
 ```
-wire            110 checks   translate       146 checks
+wire            110 checks   translate       151 checks
 adapter          69 checks   auth             54 checks
 login            75 checks   retry/backoff    33 checks
 wire events       10 checks   model fallback   14 checks
 auto-continue     22 checks   request budget   13 checks
-enterprise/IdC    33 checks   account catalog  37 checks
-kiro runtime      55 checks   proxy over HTTP  40 checks
+enterprise/IdC    33 checks   account catalog  45 checks
+kiro runtime      60 checks   proxy over HTTP  40 checks
 host mount        32 checks   web UI          121 checks
 import integrity  24 checks
 ```
@@ -228,7 +228,7 @@ Live against a real Kiro account: 21 models discovered, plan and credit usage re
 - **Tool names** must match `^[A-Za-z][A-Za-z0-9_]{0,63}$`; others are renamed with a recorded mapping.
 - **SOCKS proxies** are not supported; only HTTP/HTTPS `CONNECT`.
 - **Token counts** use provider-reported values where present; otherwise input is priced from `contextUsagePercentage × context window`, output is estimated from emitted characters, and the usage is marked `estimated: true`.
-- **The runtime transport reports credits, not tokens.** On `chatTransport: 'kiro-runtime'` the token counts are unknown — the service prices the turn in credits — so the usage is marked as not measured and the credits are carried through instead.
+- **The runtime transport reports credits, not tokens.** On `chatTransport: 'kiro-runtime'` the token counts are unknown — the service prices the turn in credits — so the usage payload carries `kiro_estimated: true` alongside the credits that were measured, instead of zeros that read like a measurement.
 - **Enterprise model ids** come from the account's own catalog (the management plane), whose `modelId` is the id the data plane accepts. `modelIds` is only needed as an override for an account that falls back to the global catalog.
 
 ## Layout
@@ -352,8 +352,10 @@ OIDC 注册固定带 Kiro 自己的身份中心 issuer。少了它，AWS 门户�
    ```
 
    `origin` 与 `profileArn` 都是必填，区域取自 profile ARN。响应体与 CodeWhisperer 那份同形，
-   里面的 `modelId` **就是**数据面认的那个 id，不需要再翻译。插件优先问这份目录，
-   只有在没有账号目录可问（没有 profile ARN）或管理面拒绝/失败时才退回公开目录。
+   里面的 `modelId` **就是**数据面认的那个 id，不需要再翻译。插件对**企业账号**
+   （`idc` / `external_idp`）优先问这份目录，管理面拒绝/失败时才退回公开目录。
+   个人账号根本不去问 —— 对那个账号来说全局目录才是对的那份。分界是认证方式，
+   不是有没有 profile ARN：插件对个人账号也会发现出 ARN，光有 ARN 不等于企业账号。
 
    企业账号实测：管理面给 8 个模型（默认 `gpt-5.6-sol`，以及 `gpt-5.6-terra`、`gpt-5.6-luna`、
    `deepseek-3.2`、`minimax-m2.5`、`minimax-m2.1`、`glm-5`、`qwen3-coder-next`），
@@ -388,8 +390,8 @@ eventstream。它的请求契约是实测的：
 - `tool_choice` 被拒 —— 一律不发；
 - 回包的 `usage` 是 **credits，不是 token**
   （`{"kiro:credits":{"value":0.0115,"unit":"credit"},"kiro:context_usage_percentage":0.119}`），
-  所以这条通道上 token 用量是未知的。插件把它报成"没测到"（`estimated: true`）并带上
-  credits，而不是把 0 当成测出来的数。
+  所以这条通道上 token 用量是未知的。插件把它报成"没测到"（usage 里的
+  `kiro_estimated: true`）并带上真的测到的 credits，而不是把 0 当成测出来的数。
 
 ## 在 Harness 之外使用
 
@@ -483,13 +485,13 @@ OpenAI 客户端都会对它做 `JSON.parse`。
 离线套件（`npm test` 一次跑完；除 `live-*` 探针外都不需要凭据，也不需要 Host）：
 
 ```
-wire            110 项    translate       146 项
+wire            110 项    translate       151 项
 adapter          69 项    auth             54 项
 login            75 项    retry/backoff    33 项
 wire events       10 项    model fallback   14 项
 auto-continue     22 项    request budget   13 项
-enterprise/IdC    33 项    account catalog  37 项
-kiro runtime      55 项    proxy over HTTP  40 项
+enterprise/IdC    33 项    account catalog  45 项
+kiro runtime      60 项    proxy over HTTP  40 项
 host mount        32 项    web UI          121 项
 import integrity  24 项
 ```
@@ -512,7 +514,8 @@ import integrity  24 项
 - **token 计数**优先用 provider 上报值；缺失时输入侧按 `contextUsagePercentage × 上下文窗口`
   定价、输出侧按字符数估算，并标 `estimated: true`。
 - **运行时通道报的是 credits，不是 token**：`chatTransport: 'kiro-runtime'` 上 token 数是未知的
-  （服务端用 credits 计价），所以用量标成"没测到"，并把 credits 带出去。
+  （服务端用 credits 计价），所以 usage 里带 `kiro_estimated: true`，并把真的测到的 credits 带出去，
+  而不是把 0 当成测出来的数。
 - **企业账号的模型 id**来自账号自己的目录（管理面），那份目录的 `modelId` 就是数据面认的 id；
   `modelIds` 只是给退回全局目录的账号做覆盖用的。
 
