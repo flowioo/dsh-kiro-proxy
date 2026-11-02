@@ -75,26 +75,51 @@ The OIDC registration carries Kiro's own Identity Center issuer. Without it the 
 
 ### Enterprise accounts (IAM Identity Center)
 
-Enterprise accounts are served by a different data plane than personal ones, and three things differ. All three are handled by the plugin; the first two are automatic, the third needs a setting.
+Enterprise accounts are served by a different data plane than personal ones, and three things differ. All three are handled by the plugin.
 
 1. **Client identity.** An enterprise request has to present the Kiro *CLI*'s identity (`KiroCLI/… app/AmazonQ-For-CLI acp-client/kiro-cli`), not the IDE's (`KiroIDE`). With the IDE agent the service answers `INVALID_MODEL_ID` for every model. Personal accounts keep the IDE agent — their behaviour is unchanged.
-2. **Traffic attribution.** `userInputMessage.origin` is `KIRO_CLI` for enterprise accounts and `AI_EDITOR` for personal ones.
-3. **Model ids.** The public catalog only publishes friendly names (`claude-opus-5.5`, `auto`, …), but an enterprise account's data plane accepts a different, account-specific id. That mapping is not derivable from anything the service publishes — the official CLI resolves it inside its native core — so it has to come from the account holder:
+2. **Traffic attribution.** `userInputMessage.origin` is `KIRO_CLI` for enterprise accounts and `AI_EDITOR` for personal ones. The token announces itself with `TokenType: SSO_OIDC`, which is what the CLI sends for an Identity Center token.
+3. **The account's own model catalog.** The public CodeWhisperer catalog is *every model Kiro ships* — the whole Claude family included — while an enterprise account is only entitled to a subset of it. Every id outside that entitlement is answered `Invalid model. Please select a different model to continue.` (`INVALID_MODEL_ID`), which is exactly why picking `opus 5.5` failed. The models this account may actually route to live on Kiro's management plane:
+
+   ```
+   GET https://management.<region>.kiro.dev/ListAvailableModels?origin=AI_EDITOR&profileArn=<arn>
+   ```
+
+   `origin` and `profileArn` are both required, and the region comes from the profile ARN. The response has the same shape as the CodeWhisperer one, and its `modelId` **is** the id the data plane accepts — there is no alias to translate. The plugin asks this catalog first and falls back to the public one only when there is no account catalog to ask (no profile ARN) or the management plane refuses or fails.
+
+   Measured on an enterprise account: the management plane lists 8 models (`gpt-5.6-sol` as the default, `gpt-5.6-terra`, `gpt-5.6-luna`, `deepseek-3.2`, `minimax-m2.5`, `minimax-m2.1`, `glm-5`, `qwen3-coder-next`), while the global catalog lists 21 — those 8 plus `auto` and the entire Claude family, none of which the account is entitled to.
+
+   For an account that still falls back to the global catalog, the friendly-name → wire-id mapping and the probe list remain available as manual overrides:
 
    ```yaml
    modelIds:
      claude-opus-5.5: CLAUDE_OPUS_5_5_V1_0
-   ```
-
-   When the upstream answers `INVALID_MODEL_ID` / `model_not_found` and no mapping matched, the `modelIdProbe` list is tried in order and the first id that works is remembered for that friendly name:
-
-   ```yaml
    modelIdProbe: [CLAUDE_OPUS_5_5_V1_0, CLAUDE_SONNET_4_5_20250929_V1_0]
    ```
 
-   If every candidate fails, the upstream's own error is reported unchanged.
+   When the upstream answers `INVALID_MODEL_ID` / `model_not_found` and no mapping matched, the `modelIdProbe` list is tried in order and the first id that works is remembered for that friendly name. If every candidate fails, the upstream's own error is reported unchanged.
 
 The profile ARN is discovered with `ListAvailableProfiles` (POST with an **empty** body — the service rejects `{"maxResults":50}`) and decides the region the requests go to.
+
+### The optional runtime transport
+
+`chatTransport: 'kiro-runtime'` sends the turn to Kiro's runtime
+(`runtime.<region>.kiro.dev/v1/responses`, OpenAI Responses API) instead of the
+CodeWhisperer eventstream. Its request contract is measured:
+
+- required headers — `TokenType: SSO_OIDC` (IdC), `x-amzn-kiro-origin: KIRO_CLI`,
+  `x-amzn-kiro-profile: <arn>`, `x-amzn-codewhisperer-optout: true`, and the CLI
+  user-agent (the runtime is the CLI's own service, so the identity is the CLI's
+  on this path whatever the account is);
+- `instructions` is refused (`systemPrompt field is not enabled for this user.`) —
+  the system prompt travels inside the first user turn instead, exactly as on the
+  eventstream path;
+- `tool_choice` is refused — it is never sent;
+- the reply's `usage` is **credits, not tokens**
+  (`{"kiro:credits":{"value":0.0115,"unit":"credit"},"kiro:context_usage_percentage":0.119}`),
+  so token usage on that path is unknown. The plugin reports it as *not measured*
+  (`estimated: true`) and carries the credits through, instead of passing zeros
+  off as a measurement.
 
 ## Using it outside the Harness
 
@@ -151,7 +176,7 @@ The key is not enforced by default (the proxy listens on loopback). Set `require
 | `maxRequestChars` | `320000` | Character budget for one request; the oldest turns are dropped and oversized tool results clipped. |
 | `autoContinue` | `true` | Send one more `continue` turn when a stream produced reasoning but nothing visible. |
 | `maxContinuations` | `2` | Upper bound on those automatic continuations. |
-| `modelIds` | none | `{ "<friendly model name>": "<id the upstream accepts>" }`. Enterprise accounts need it: the catalog only publishes friendly names, and the data plane accepts an account-specific id. |
+| `modelIds` | none | `{ "<friendly model name>": "<id the upstream accepts>" }`. Only needed as an override: the account catalog publishes the wire id itself, but an account that falls back to the global catalog may need a mapping. |
 | `modelIdProbe` | none | Candidate ids tried in order when the upstream refuses the model (`INVALID_MODEL_ID` / `model_not_found`). The first one that works is remembered in memory for that friendly name; if all fail, the upstream's own error is reported. |
 | `chatTransport` | `aws` | `aws` = CodeWhisperer eventstream. `kiro-runtime` = `runtime.<region>.kiro.dev/v1/responses` (OpenAI Responses API). The runtime is a separate data plane; its request contract is measured, its response framing is **not** verified against the live service. |
 
@@ -183,17 +208,17 @@ Offline suites, run them all with `npm test` (`tests/run-all.mjs`); everything e
 
 ```
 wire            110 checks   translate       146 checks
-adapter          49 checks   auth             54 checks
-wire events       6 checks   retry/backoff    21 checks
-model fallback   14 checks   request budget   13 checks
-auto-continue    12 checks   enterprise/IdC   33 checks
-proxy over HTTP  40 checks   host mount       32 checks
-kiro runtime     33 checks
-post-install     35 checks   web UI           78 checks
-import integrity 21 checks
+adapter          69 checks   auth             54 checks
+login            75 checks   retry/backoff    33 checks
+wire events       10 checks   model fallback   14 checks
+auto-continue     22 checks   request budget   13 checks
+enterprise/IdC    33 checks   account catalog  37 checks
+kiro runtime      55 checks   proxy over HTTP  40 checks
+host mount        32 checks   web UI          121 checks
+import integrity  24 checks
 ```
 
-Live against a real Kiro account: 21 models discovered, plan and credit usage read, streaming text, native reasoning, a two-turn tool loop (`tool-calls` → `stop`), both proxy surfaces in streaming and non-streaming mode, automatic model fallback (~5.7 s for a turn the selected model refused), and an 8 MB-shaped history answered in ~7.9 s instead of `Input is too long.`.
+Live against a real Kiro account: 21 models discovered, plan and credit usage read, streaming text, native reasoning, a two-turn tool loop (`tool-calls` → `stop`), both proxy surfaces in streaming and non-streaming mode, automatic model fallback (~5.7 s for a turn the selected model refused), and an 8 MB-shaped history answered in ~7.9 s instead of `Input is too long.`. Live against an IAM Identity Center account: the management-plane catalog (8 entitled models against 21 in the global catalog), the `SSO_OIDC` token type, and the runtime transport's request contract.
 
 ## Known limits
 
@@ -203,7 +228,8 @@ Live against a real Kiro account: 21 models discovered, plan and credit usage re
 - **Tool names** must match `^[A-Za-z][A-Za-z0-9_]{0,63}$`; others are renamed with a recorded mapping.
 - **SOCKS proxies** are not supported; only HTTP/HTTPS `CONNECT`.
 - **Token counts** use provider-reported values where present; otherwise input is priced from `contextUsagePercentage × context window`, output is estimated from emitted characters, and the usage is marked `estimated: true`.
-- **Enterprise model ids** have to be supplied (`modelIds`). The catalog only publishes friendly names and the enterprise data plane accepts an account-specific id; the service does not publish that mapping (the official CLI resolves it inside its native core), so it cannot be derived.
+- **The runtime transport reports credits, not tokens.** On `chatTransport: 'kiro-runtime'` the token counts are unknown — the service prices the turn in credits — so the usage is marked as not measured and the credits are carried through instead.
+- **Enterprise model ids** come from the account's own catalog (the management plane), whose `modelId` is the id the data plane accepts. `modelIds` is only needed as an override for an account that falls back to the global catalog.
 
 ## Layout
 
@@ -309,32 +335,61 @@ OIDC 注册固定带 Kiro 自己的身份中心 issuer。少了它，AWS 门户�
 
 ### 企业账号（IAM 身份中心）
 
-企业账号走的数据面与个人账号不同，有三处差别。前两处插件自动处理，第三处需要一项设置。
+企业账号走的数据面与个人账号不同，有三处差别，插件全部自动处理。
 
 1. **客户端身份**：企业请求必须报 Kiro **CLI** 的身份（`KiroCLI/… app/AmazonQ-For-CLI
    acp-client/kiro-cli`），不能报 IDE 的（`KiroIDE`）。带 IDE 身份时，服务端对每个模型
    都回 `INVALID_MODEL_ID`。个人账号仍然报 IDE 身份，行为不变。
-2. **流量归因**：企业账号的 `userInputMessage.origin` 是 `KIRO_CLI`，个人账号是 `AI_EDITOR`。
-3. **模型 id**：公开目录只给友好名（`claude-opus-5.5`、`auto`……），企业账号的数据面却只认
-   另一套账号私有的 id。这份映射无法从服务端公开的任何东西推导出来（官方 CLI 是在自己的
-   native core 里解析的），只能由账号持有人提供：
+2. **流量归因**：企业账号的 `userInputMessage.origin` 是 `KIRO_CLI`，个人账号是 `AI_EDITOR`；
+   token 用 `TokenType: SSO_OIDC` 报自己的身份（CLI 对 IdC token 就是这么发的）。
+3. **账号自己的模型目录**：CodeWhisperer 那份公开目录是 **Kiro 卖的所有模型**（Claude 全家都在
+   里面），而企业账号只被授予其中一部分：不在授权内的 id 一律回
+   `Invalid model. Please select a different model to continue.`（`INVALID_MODEL_ID`）——
+   这正是之前选 `opus 5.5` 失败的原因。这个账号真正能路由的模型在 Kiro 的管理面上：
+
+   ```
+   GET https://management.<region>.kiro.dev/ListAvailableModels?origin=AI_EDITOR&profileArn=<arn>
+   ```
+
+   `origin` 与 `profileArn` 都是必填，区域取自 profile ARN。响应体与 CodeWhisperer 那份同形，
+   里面的 `modelId` **就是**数据面认的那个 id，不需要再翻译。插件优先问这份目录，
+   只有在没有账号目录可问（没有 profile ARN）或管理面拒绝/失败时才退回公开目录。
+
+   企业账号实测：管理面给 8 个模型（默认 `gpt-5.6-sol`，以及 `gpt-5.6-terra`、`gpt-5.6-luna`、
+   `deepseek-3.2`、`minimax-m2.5`、`minimax-m2.1`、`glm-5`、`qwen3-coder-next`），
+   全局目录给 21 个 —— 那 8 个加上 `auto` 与整个 Claude 家族，而账号一个都没被授权。
+
+   退回全局目录的账号仍然可以手动覆盖：
 
    ```yaml
    modelIds:
      claude-opus-5.5: CLAUDE_OPUS_5_5_V1_0
-   ```
-
-   上游回 `INVALID_MODEL_ID` / `model_not_found` 且映射没命中时，按 `modelIdProbe` 的顺序
-   试候选 id，第一个能用的会被记住（同一个友好名之后直接用它）：
-
-   ```yaml
    modelIdProbe: [CLAUDE_OPUS_5_5_V1_0, CLAUDE_SONNET_4_5_20250929_V1_0]
    ```
 
-   候选全部失败时，报的是上游原本的错误。
+   上游回 `INVALID_MODEL_ID` / `model_not_found` 且映射没命中时，按 `modelIdProbe` 的顺序
+   试候选 id，第一个能用的会被记住（同一个友好名之后直接用它）；候选全部失败时，
+   报的是上游原本的错误。
 
 profile ARN 用 `ListAvailableProfiles` 发现（POST 的**请求体是空对象**——服务端会拒
 `{"maxResults":50}`），并由它决定请求打到的区域。
+
+### 可选的运行时通道
+
+`chatTransport: 'kiro-runtime'` 把这一轮发到 Kiro 的运行时
+（`runtime.<region>.kiro.dev/v1/responses`，OpenAI Responses API），而不是 CodeWhisperer 的
+eventstream。它的请求契约是实测的：
+
+- 必填的头 —— `TokenType: SSO_OIDC`（IdC）、`x-amzn-kiro-origin: KIRO_CLI`、
+  `x-amzn-kiro-profile: <arn>`、`x-amzn-codewhisperer-optout: true`，以及 CLI 的 user-agent
+  （运行时是 CLI 自己的服务，所以这条通道上的身份一律是 CLI 的）；
+- `instructions` 被拒（`systemPrompt field is not enabled for this user.`）——系统提示词照旧
+  走第一条 user 轮；
+- `tool_choice` 被拒 —— 一律不发；
+- 回包的 `usage` 是 **credits，不是 token**
+  （`{"kiro:credits":{"value":0.0115,"unit":"credit"},"kiro:context_usage_percentage":0.119}`），
+  所以这条通道上 token 用量是未知的。插件把它报成"没测到"（`estimated: true`）并带上
+  credits，而不是把 0 当成测出来的数。
 
 ## 在 Harness 之外使用
 
@@ -388,7 +443,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:PORT ANTHROPIC_API_KEY=kr-xxxx claude
 | `maxRequestChars` | `320000` | 单次请求的字符预算；超出时先丢最旧的整轮，再裁剪超长工具结果。 |
 | `autoContinue` | `true` | 只有 reasoning、没有可见内容时，自动再发一轮 `continue`。 |
 | `maxContinuations` | `2` | 自动续写的次数上限。 |
-| `modelIds` | 无 | `{ "<友好模型名>": "<上游认的 id>" }`。企业账号必须填：目录只给友好名，数据面认的是账号私有的一套 id。 |
+| `modelIds` | 无 | `{ "<友好模型名>": "<上游认的 id>" }`。只是覆盖手段：账号目录给的就已经是 wire id，退回全局目录的账号才可能需要映射。 |
 | `modelIdProbe` | 无 | 上游拒绝模型 id（`INVALID_MODEL_ID` / `model_not_found`）时按顺序试的候选 id；第一个能用的在内存里记住，全失败时报上游原本的错误。 |
 | `chatTransport` | `aws` | `aws` = CodeWhisperer eventstream；`kiro-runtime` = `runtime.<region>.kiro.dev/v1/responses`（OpenAI Responses API）。运行时是另一条数据面：请求契约是实测的，响应事件名**未**对活服务验证。 |
 
@@ -429,19 +484,21 @@ OpenAI 客户端都会对它做 `JSON.parse`。
 
 ```
 wire            110 项    translate       146 项
-adapter          49 项    auth             54 项
-wire events       6 项    retry/backoff    21 项
-model fallback   14 项    request budget   13 项
-auto-continue    12 项
-proxy over HTTP  40 项    host mount       32 项
-post-install     35 项    web UI           78 项
-import integrity 21 项
+adapter          69 项    auth             54 项
+login            75 项    retry/backoff    33 项
+wire events       10 项    model fallback   14 项
+auto-continue     22 项    request budget   13 项
+enterprise/IdC    33 项    account catalog  37 项
+kiro runtime      55 项    proxy over HTTP  40 项
+host mount        32 项    web UI          121 项
+import integrity  24 项
 ```
 
 真实账号上验证过：21 个模型发现、计划与额度读取、流式文本、原生 reasoning、两轮工具循环
 （`tool-calls` → `stop`）、OpenAI 与 Anthropic 两个面的流式与非流式、自动换模型
 （被拒的那一轮约 5.7s 拿到回答）、以及 8MB 形状的历史在约 7.9s 内正常作答而不是
-`Input is too long.`。
+`Input is too long.`。IAM 身份中心账号上验证过：管理面目录（8 个被授权的模型 vs 全局目录的
+21 个）、`SSO_OIDC` 这个 token 类型、以及运行时通道的请求契约。
 
 ## 已知边界
 
@@ -454,8 +511,10 @@ import integrity 21 项
 - **SOCKS 代理**不支持，只支持 HTTP/HTTPS `CONNECT`。
 - **token 计数**优先用 provider 上报值；缺失时输入侧按 `contextUsagePercentage × 上下文窗口`
   定价、输出侧按字符数估算，并标 `estimated: true`。
-- **企业账号的模型 id 映射**要自己给（`modelIds`）：目录只公开友好名，企业数据面认的是
-  账号私有的一套 id，服务端不发布这份映射，官方 CLI 是在自己的 native core 里解析的。
+- **运行时通道报的是 credits，不是 token**：`chatTransport: 'kiro-runtime'` 上 token 数是未知的
+  （服务端用 credits 计价），所以用量标成"没测到"，并把 credits 带出去。
+- **企业账号的模型 id**来自账号自己的目录（管理面），那份目录的 `modelId` 就是数据面认的 id；
+  `modelIds` 只是给退回全局目录的账号做覆盖用的。
 
 ## 目录
 

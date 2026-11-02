@@ -39,8 +39,9 @@
 是 `AI_EDITOR`，企业账号（`idc` / `external_idp`）是 `KIRO_CLI`——企业账号走的是 Kiro CLI
 那一侧的数据面，带 IDE 的归因会被拒。
 
-`modelId` 也可能与目录里的友好名不同：企业账号的数据面只认账号私有的一套 id，
-友好名到 wire id 的映射由 `modelIds` 设置提供（见第 5 节）。
+`modelId` 一般就是目录里的那个 id：账号目录（第 1a 节）给的 `modelId` 已经是数据面
+认的那个 id。只有退回全局目录的账号才可能对不上，那时由 `modelIds` 设置提供
+友好名到 wire id 的映射（见第 5 节）。
 
 响应：`content-type: application/vnd.amazon.eventstream`，逐帧：
 
@@ -65,7 +66,9 @@ payload 事件（`headers[':event-type']` 或 `:exception-type`）：
 `accept: application/vnd.amazon.eventstream`、`x-amzn-kiro-agent-mode: vibe`、
 `x-amzn-codewhisperer-optout: true`、`Amz-Sdk-Request: attempt=1; max=3`、
 `Amz-Sdk-Invocation-Id: <uuid>`、`x-amzn-codewhisperer-machine-id: kiro-desktop`；
-api_key 追加 `TokenType: API_KEY`，external_idp 追加 `TokenType: EXTERNAL_IDP`；
+api_key 追加 `TokenType: API_KEY`，external_idp 追加 `TokenType: EXTERNAL_IDP`，
+idc 追加 `TokenType: SSO_OIDC`（Kiro CLI 自己的映射：`IdC -> SSO_OIDC`、
+`external_idp -> EXTERNAL_IDP`、`api_key -> API_KEY`、`machine_token -> KIRO_MACHINE_TOKEN`）；
 有 profileArn 时追加 `x-amzn-codewhisperer-profile-arn`。
 
 `user-agent` 与 `x-amz-user-agent` 按账号分派（Kiro 按客户端身份授权，不是按归因）：
@@ -82,19 +85,73 @@ api_key 追加 `TokenType: API_KEY`，external_idp 追加 `TokenType: EXTERNAL_I
 `ListAvailableProfiles`（POST）的请求体必须是 `{}`：带 `{"maxResults":50}` 会回
 `400 REQUEST_BODY_INVALID`，那样 profile ARN 永远解析不出来。
 
-## 1b. Kiro 运行时通道（可选，未对活服务验证）
+## 1a. 账号目录（模型发现）
+
+模型列表有两个来源，**账号自己的目录优先**：
+
+| 来源 | 端点 | 含义 |
+| --- | --- | --- |
+| 账号目录（管理面） | `GET https://management.<region>.kiro.dev/ListAvailableModels?origin=<origin>&profileArn=<arn>` | 这个账号**被授予**的模型。`modelId` 就是 wire 上那个 id |
+| 全局目录（CodeWhisperer） | `GET https://codewhisperer.<region>.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&maxResults=50[&profileArn=<arn>]` | Kiro 卖的所有模型（Claude 全家都在里面） |
+
+全局目录是"所有模型的并集"，IdC / Enterprise 账号只被授予其中一部分：选到没被授予的
+id，数据面回 `400 {"message":"Invalid model. Please select a different model to
+continue.","reason":"INVALID_MODEL_ID"}`。所以模型选择器里给出的每个 id 都必须是
+账号目录里的那些。
+
+账号目录的契约（实测）：
+
+- `origin` 必填，缺了回 `400 … Value null at 'origin' failed to satisfy constraint`；
+  它只影响**展示名**：`KIRO_CLI` 的 `modelName` 是 null（名字退回 id），
+  `AI_EDITOR` 给的是 `"GPT 5.6 Sol"` 这样的友好名；两者的模型集合完全一致。
+- `profileArn` 对 IdC 账号必填，缺了回 `400 {"message":"Invalid profileArn."}`；
+  没有 ARN 的账号（个人 Builder 登录）没有账号目录，用全局目录——对那个账号来说
+  全局目录就是对的。
+- 区域取自 profile ARN（`arn:aws:codewhisperer:us-east-1:…` -> `us-east-1`），
+  不是 token 自己带的区域。
+- 头就是常规 Kiro 头：`Authorization: Bearer <token>`、企业账号的 CLI user-agent、
+  `x-amzn-codewhisperer-profile-arn`。`TokenType` 收但不要求。
+- 响应体与 CodeWhisperer 那份同形（`models[].modelId / modelName / description /
+  tokenLimits / supportedInputTypes / additionalModelRequestFieldsSchema / …`，
+  另有 `defaultModel`），所以 `parseModelPage()` 原样解析。
+
+**退回规则**：账号目录拿不到时（非 200、抛错、响应没有 `models` 数组、空目录、
+没有 profileArn）一律退回全局目录，模型列表不因此失败；两个目录都失败才报错。
+目录太宽只是让用户选到用不了的模型，没有目录则是插件直接不可用。
+
+## 1b. Kiro 运行时通道（可选）
 
 `chatTransport: 'kiro-runtime'` 时聊天改走 `https://runtime.<region>.kiro.dev/v1/responses`
 （POST，OpenAI Responses API）。实测的请求契约：
 
 ```
-{ model, input, profileArn, origin: 'KIRO_CLI', stream: true }
+{
+  model, input, profileArn, origin: 'KIRO_CLI', stream: true,
+  metadata: { 'kiro:agent_mode': 'vibe', 'kiro:conversation_id': <id>, 'kiro:root_conversation_id': <id> }
+}
 ```
 
 - 缺 `profileArn` -> `profileArn is required for this request.`
 - 缺 `stream` -> `Non-streaming responses are not supported for this request. Please set stream=true.`
 - 缺 `origin` -> `origin is required unless the request carries the Kiro Reasoning service principal`
 - 模型 id 不被接受 -> `Invalid model ID: <id>`，`code: model_not_found`
+- 发 `instructions` -> `systemPrompt field is not enabled for this user.`（param `instructions`）
+  ——**永远不发**，系统提示词走第一条 user 轮
+- 发 `tool_choice` -> `This request contains parameters or input that are not supported.`
+  （param `tool_choice`）——**永远不发**
+- `reasoning: { effort }` 收，`reasoning: { type: 'adaptive' }` 拒（param `reasoning.type`）；
+  插件两边都不发
+
+必填的头（CLI 那一侧的服务按这些头认流量）：
+
+```
+authorization: Bearer <accessToken>
+user-agent: <CLI user-agent>          # 运行时是 CLI 自己的服务，身份一律是 CLI 的
+x-amzn-codewhisperer-optout: true
+x-amzn-kiro-origin: KIRO_CLI
+x-amzn-kiro-profile: <profileArn>
+TokenType: SSO_OIDC                    # IdC；external_idp -> EXTERNAL_IDP，api_key -> API_KEY
+```
 
 响应是 `text/event-stream`，OpenAI Responses 事件帧
 （`response.output_text.delta`、`response.reasoning_text.delta`、
@@ -102,8 +159,18 @@ api_key 追加 `TokenType: API_KEY`，external_idp 追加 `TokenType: EXTERNAL_I
 `response.output_item.done`、`response.completed` / `response.failed`），
 由 `lib/kiro-runtime.js` 翻译成第 4 节的内部事件词汇。
 
-**状态：请求契约是实测的；响应事件名是按 OpenAI Responses 的公开形状实现的，
-没有对活服务验证过。** 默认关闭（`chatTransport` 默认 `aws`）。
+**运行时这条通道的 `usage` 不是 token 数**：
+
+```
+{"kiro:credits":{"value":0.0115,"unit":"credit","unit_plural":"credits"},
+ "kiro:context_usage_percentage":0.119}
+```
+
+所以这条通道上 token 用量是 0，插件不编数字：usage 事件标成 `estimated: true`
+（"没测到"而不是"测到 0"），并把真正测到的 credits 带出去。
+
+**状态：请求契约与 usage 形状是实测的；响应事件名是按 OpenAI Responses 的公开形状
+实现的，没有对活服务验证过。** 默认关闭（`chatTransport` 默认 `aws`）。
 
 ## 2. 模块边界
 
@@ -223,10 +290,14 @@ export function anthropicResponse(state)          // -> 非流式 /v1/messages �
 { kind: 'tool-start', id, name }
 { kind: 'tool-delta', id, argumentsDelta }
 { kind: 'tool-stop', id }
-{ kind: 'usage', inputTokens, outputTokens, cacheReadTokens?, cacheWriteTokens?, contextPercentage? }
+{ kind: 'usage', inputTokens, outputTokens, cacheReadTokens?, cacheWriteTokens?, contextPercentage?, estimated?, credits?, creditsUnit? }
 { kind: 'stop', stopReason }   // END_TURN | TOOL_USE | MAX_TOKENS | MODEL_CONTEXT_WINDOW_EXCEEDED | CONTENT_FILTERED | PAUSE_TURN
 { kind: 'error', message, code }
 ```
+
+`usage` 事件里 `estimated: true` 的意思是"这两个 token 数不是服务端报出来的"，
+不是"这两个数是估的"——运行时那条通道只报 credits，token 数根本没测到，
+这时 `credits` / `creditsUnit` 才是这一轮真正测到的数。
 
 ## 5. 状态 API（UI 依赖）
 
@@ -238,8 +309,8 @@ Host 挂在 `webServer`：
 - `POST /kiro-proxy/api/accounts/import` `{ json | refreshToken | apiKey, label? }`
 - `POST /kiro-proxy/api/accounts/remove` `{ id }`
 - `POST /kiro-proxy/api/settings` `{ proxyUrl?, region?, profileArn?, maxContextWindow?, enabledModels?, modelIds?, modelIdProbe?, chatTransport? }`
-  - `modelIds`: `{ "<友好模型名>": "<上游真正认的 id>" }`。目录只给友好名，企业账号的
-    数据面却只认账号私有的一套 id；这份映射只能由账号持有人提供。
+  - `modelIds`: `{ "<友好模型名>": "<上游真正认的 id>" }`。账号目录（第 1a 节）给的就是
+    wire id，这份映射是给退回全局目录的账号准备的覆盖项。
   - `modelIdProbe`: `string[]`。上游回 `INVALID_MODEL_ID` / `model_not_found` 时按顺序
     试这些候选 id，第一个能用的在内存里记住（同一个友好名之后直接用它）。
     全部失败时报的是上游原本的错误，不换错误码、不换措辞。

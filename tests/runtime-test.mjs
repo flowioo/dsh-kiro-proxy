@@ -3,8 +3,15 @@
  *
  * 这条通道是可选的（`chatTransport: 'kiro-runtime'`），它说的是 OpenAI
  * Responses API：请求体是 `{ model, input, profileArn, origin, stream }`，
- * 回的是 SSE。这里的断言只覆盖"插件自己那一侧"：报文怎么拼、SSE 怎么解、
- * 解出来的事件怎么归一化。上游的真实事件名尚未对活服务验证过。
+ * 回的是 SSE。
+ *
+ * 请求契约是对活服务实测的，钉在这里的是三件事：
+ * 1. 必填的头（CLI 身份、`x-amzn-kiro-origin`、`x-amzn-kiro-profile`、
+ *    `TokenType: SSO_OIDC`）与必填的字段；
+ * 2. 服务端拒绝的字段：`instructions` 与 `tool_choice` 一个都不能发；
+ * 3. 回包里的 `usage` 是 credits 而不是 token 数，所以 token 数不许编。
+ *
+ * 事件名仍是按 OpenAI Responses 的公开形状实现的（插件自己那一侧）。
  *
  * Run: node tests/runtime-test.mjs
  */
@@ -97,6 +104,18 @@ function sseStream(blocks) {
     && request.tools[0]?.name === 'fs_read', JSON.stringify(request.tools))
   check('端点按区域拼', kiroRuntimeEndpoint('us-east-1') === 'https://runtime.us-east-1.kiro.dev/v1/responses',
     kiroRuntimeEndpoint('us-east-1'))
+  // 运行时明确拒绝这两个字段：instructions -> "systemPrompt field is not enabled
+  // for this user."，tool_choice -> "This request contains parameters or input
+  // that are not supported."。系统提示词因此走第一条 user 轮，不进 instructions。
+  check('请求体不带 instructions（运行时拒绝）', request.instructions === undefined,
+    JSON.stringify(request.instructions))
+  check('请求体不带 tool_choice（运行时拒绝）', request.tool_choice === undefined,
+    JSON.stringify(request.tool_choice))
+  check('元数据带 agent 模式', request.metadata?.['kiro:agent_mode'] === 'vibe',
+    JSON.stringify(request.metadata))
+  check('元数据带会话 id 与 root 会话 id',
+    request.metadata?.['kiro:conversation_id'] === 'c1'
+    && request.metadata?.['kiro:root_conversation_id'] === 'c1', JSON.stringify(request.metadata))
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +225,21 @@ function sseStream(blocks) {
     sent.model === 'm1' && sent.stream === true && sent.origin === 'KIRO_CLI' && sent.profileArn === ARN,
     JSON.stringify(sent))
   check('请求体带 input', Array.isArray(sent.input) && sent.input.length === 1, JSON.stringify(sent.input))
+  check('发出去的报文不带 instructions', sent.instructions === undefined, JSON.stringify(sent.instructions))
+  check('发出去的报文不带 tool_choice', sent.tool_choice === undefined, JSON.stringify(sent.tool_choice))
   check('运行时请求用 CLI 的 user-agent',
     String(calls[0]?.headers?.['user-agent']).startsWith('KiroCLI/'), calls[0]?.headers?.['user-agent'])
   check('运行时请求带 profile ARN 头',
     calls[0]?.headers?.['x-amzn-codewhisperer-profile-arn'] === ARN, calls[0]?.headers?.['x-amzn-codewhisperer-profile-arn'])
+  check('运行时请求带 kiro origin 头',
+    calls[0]?.headers?.['x-amzn-kiro-origin'] === 'KIRO_CLI', calls[0]?.headers?.['x-amzn-kiro-origin'])
+  check('运行时请求带 kiro profile 头',
+    calls[0]?.headers?.['x-amzn-kiro-profile'] === ARN, calls[0]?.headers?.['x-amzn-kiro-profile'])
+  check('运行时请求带 optout 头',
+    calls[0]?.headers?.['x-amzn-codewhisperer-optout'] === 'true',
+    calls[0]?.headers?.['x-amzn-codewhisperer-optout'])
+  check('IdC 账号的 TokenType 是 SSO_OIDC',
+    calls[0]?.headers?.TokenType === 'SSO_OIDC', calls[0]?.headers?.TokenType)
   check('SSE 正文被翻译成 text 事件',
     events.some(event => event.kind === 'text' && event.text === '你好'), JSON.stringify(events))
   check('SSE 收尾给出 stop', events.at(-1)?.kind === 'stop', JSON.stringify(events.at(-1)))
@@ -219,7 +249,56 @@ function sseStream(blocks) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. 运行时拒绝模型 id 时也按候选顺序试
+// 4. 运行时这条通道始终是 CLI 的身份（不管账号是哪一种）
+// ---------------------------------------------------------------------------
+{
+  const calls = []
+  const client = new KiroClient({
+    options: () => ({ chatTransport: 'kiro-runtime' }),
+    store: {
+      directory: 'unused',
+      active: async () => ({
+        credential: {
+          accessToken: 'aoa_runtime_social',
+          method: 'social',
+          region: 'us-east-1',
+          expiresAt: Date.now() + 3_600_000,
+        },
+        id: 'a',
+        label: 'A',
+      }),
+      read: async () => ({ accounts: [], activeId: null }),
+      describe: async () => ({ activeId: null, accounts: [] }),
+      clear: async () => {},
+    },
+    post: async request => {
+      calls.push(request)
+      return {
+        status: 200,
+        headers: {},
+        body: sseStream([
+          'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"好"}',
+          'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}',
+        ]),
+      }
+    },
+    sleep: async () => {},
+  })
+  for await (const event of client.sendWire({
+    conversationState: {
+      currentMessage: { userInputMessage: { content: 'hi', modelId: 'm1', origin: 'AI_EDITOR' } },
+    },
+  }, new AbortController().signal)) { void event }
+  check('个人账号在运行时上也报 CLI 的 user-agent',
+    String(calls[0]?.headers?.['user-agent']).startsWith('KiroCLI/'), calls[0]?.headers?.['user-agent'])
+  check('个人账号在运行时上不带 TokenType',
+    calls[0]?.headers?.TokenType === undefined, calls[0]?.headers?.TokenType)
+  check('运行时上 origin 头恒为 KIRO_CLI',
+    calls[0]?.headers?.['x-amzn-kiro-origin'] === 'KIRO_CLI', calls[0]?.headers?.['x-amzn-kiro-origin'])
+}
+
+// ---------------------------------------------------------------------------
+// 5. 运行时拒绝模型 id 时也按候选顺序试
 // ---------------------------------------------------------------------------
 {
   const sentModels = []
@@ -279,7 +358,78 @@ function sseStream(blocks) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. 默认仍然是 eventstream 那条路
+// 6. 运行时的 usage 是 credits，不是 token 数
+// ---------------------------------------------------------------------------
+{
+  const credits = runtimeOutcome({
+    event: 'response.completed',
+    data: {
+      type: 'response.completed',
+      response: {
+        status: 'completed',
+        usage: {
+          'kiro:credits': { value: 0.0115, unit: 'credit', unit_plural: 'credits' },
+          'kiro:context_usage_percentage': 0.119,
+        },
+      },
+    },
+  })
+  check('完成帧给出 credits', credits.usage?.credits === 0.0115, JSON.stringify(credits.usage))
+  check('完成帧给出 credits 单位', credits.usage?.creditsUnit === 'credit', JSON.stringify(credits.usage))
+  check('没有 token 字段时不声称测到了 token',
+    credits.usage?.tokensReported === false, JSON.stringify(credits.usage))
+  check('上下文百分比照常读出', credits.usage?.contextPercentage === 0.119,
+    JSON.stringify(credits.usage))
+
+  const calls = []
+  const client = new KiroClient({
+    options: () => ({ chatTransport: 'kiro-runtime' }),
+    store: {
+      directory: 'unused',
+      active: async () => ({
+        credential: {
+          accessToken: 'aoa_runtime_credits',
+          method: 'idc',
+          region: 'us-east-1',
+          expiresAt: Date.now() + 3_600_000,
+          profileArn: ARN,
+        },
+        id: 'a',
+        label: 'A',
+      }),
+      read: async () => ({ accounts: [], activeId: null }),
+      describe: async () => ({ activeId: null, accounts: [] }),
+      clear: async () => {},
+    },
+    post: async request => {
+      calls.push(request)
+      return {
+        status: 200,
+        headers: {},
+        body: sseStream([
+          'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"你好"}',
+          'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"kiro:credits":{"value":0.0115,"unit":"credit"},"kiro:context_usage_percentage":0.119}}}',
+        ]),
+      }
+    },
+    sleep: async () => {},
+  })
+  const events = []
+  for await (const event of client.sendWire({
+    conversationState: {
+      currentMessage: { userInputMessage: { content: 'hi', modelId: 'm1', origin: 'KIRO_CLI' } },
+    },
+  }, new AbortController().signal, { requestedModelId: 'm1' })) events.push(event)
+  const usage = events.find(event => event.kind === 'usage')
+  check('usage 事件带上 credits', usage?.credits === 0.0115, JSON.stringify(usage))
+  check('usage 事件标明 token 不是测出来的', usage?.estimated === true, JSON.stringify(usage))
+  check('usage 事件不编造 token 数',
+    usage?.inputTokens === 0 && usage?.outputTokens === 0, JSON.stringify(usage))
+  check('usage 事件带上上下文百分比', usage?.contextPercentage === 0.119, JSON.stringify(usage))
+}
+
+// ---------------------------------------------------------------------------
+// 7. 默认仍然是 eventstream 那条路
 // ---------------------------------------------------------------------------
 {
   const calls = []

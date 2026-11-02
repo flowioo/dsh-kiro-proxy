@@ -29,6 +29,7 @@ const SUITES = [
   'budget-test.mjs',
   'continue-test.mjs',
   'idc-test.mjs',
+  'catalog-test.mjs',
   'runtime-test.mjs',
   'proxy-e2e.mjs',
   'host-smoke.mjs',
