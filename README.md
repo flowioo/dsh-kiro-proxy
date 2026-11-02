@@ -73,6 +73,29 @@ The OIDC registration carries Kiro's own Identity Center issuer. Without it the 
 | `api_key` | no refresh | `q.<region>.amazonaws.com` + `TokenType: API_KEY` |
 | `external_idp` | its own token endpoint | `codewhisperer.<region>.amazonaws.com` + `TokenType: EXTERNAL_IDP` |
 
+### Enterprise accounts (IAM Identity Center)
+
+Enterprise accounts are served by a different data plane than personal ones, and three things differ. All three are handled by the plugin; the first two are automatic, the third needs a setting.
+
+1. **Client identity.** An enterprise request has to present the Kiro *CLI*'s identity (`KiroCLI/… app/AmazonQ-For-CLI acp-client/kiro-cli`), not the IDE's (`KiroIDE`). With the IDE agent the service answers `INVALID_MODEL_ID` for every model. Personal accounts keep the IDE agent — their behaviour is unchanged.
+2. **Traffic attribution.** `userInputMessage.origin` is `KIRO_CLI` for enterprise accounts and `AI_EDITOR` for personal ones.
+3. **Model ids.** The public catalog only publishes friendly names (`claude-opus-5.5`, `auto`, …), but an enterprise account's data plane accepts a different, account-specific id. That mapping is not derivable from anything the service publishes — the official CLI resolves it inside its native core — so it has to come from the account holder:
+
+   ```yaml
+   modelIds:
+     claude-opus-5.5: CLAUDE_OPUS_5_5_V1_0
+   ```
+
+   When the upstream answers `INVALID_MODEL_ID` / `model_not_found` and no mapping matched, the `modelIdProbe` list is tried in order and the first id that works is remembered for that friendly name:
+
+   ```yaml
+   modelIdProbe: [CLAUDE_OPUS_5_5_V1_0, CLAUDE_SONNET_4_5_20250929_V1_0]
+   ```
+
+   If every candidate fails, the upstream's own error is reported unchanged.
+
+The profile ARN is discovered with `ListAvailableProfiles` (POST with an **empty** body — the service rejects `{"maxResults":50}`) and decides the region the requests go to.
+
 ## Using it outside the Harness
 
 The settings page shows the base URLs and the generated proxy key:
@@ -107,6 +130,10 @@ The key is not enforced by default (the proxy listens on loopback). Set `require
     maxConcurrency: 2
     retryAttempts: 3
     maxRequestChars: 320000
+    modelIds:
+      claude-opus-5.5: CLAUDE_OPUS_5_5_V1_0
+    modelIdProbe: [CLAUDE_OPUS_5_5_V1_0]
+    chatTransport: aws
 ```
 
 | Field | Default | Meaning |
@@ -124,6 +151,9 @@ The key is not enforced by default (the proxy listens on loopback). Set `require
 | `maxRequestChars` | `320000` | Character budget for one request; the oldest turns are dropped and oversized tool results clipped. |
 | `autoContinue` | `true` | Send one more `continue` turn when a stream produced reasoning but nothing visible. |
 | `maxContinuations` | `2` | Upper bound on those automatic continuations. |
+| `modelIds` | none | `{ "<friendly model name>": "<id the upstream accepts>" }`. Enterprise accounts need it: the catalog only publishes friendly names, and the data plane accepts an account-specific id. |
+| `modelIdProbe` | none | Candidate ids tried in order when the upstream refuses the model (`INVALID_MODEL_ID` / `model_not_found`). The first one that works is remembered in memory for that friendly name; if all fail, the upstream's own error is reported. |
+| `chatTransport` | `aws` | `aws` = CodeWhisperer eventstream. `kiro-runtime` = `runtime.<region>.kiro.dev/v1/responses` (OpenAI Responses API). The runtime is a separate data plane; its request contract is measured, its response framing is **not** verified against the live service. |
 
 ## Failure semantics (measured, not assumed)
 
@@ -156,8 +186,9 @@ wire            110 checks   translate       146 checks
 adapter          49 checks   auth             54 checks
 wire events       6 checks   retry/backoff    21 checks
 model fallback   14 checks   request budget   13 checks
-auto-continue    12 checks
+auto-continue    12 checks   enterprise/IdC   33 checks
 proxy over HTTP  40 checks   host mount       32 checks
+kiro runtime     33 checks
 post-install     35 checks   web UI           78 checks
 import integrity 21 checks
 ```
@@ -172,6 +203,7 @@ Live against a real Kiro account: 21 models discovered, plan and credit usage re
 - **Tool names** must match `^[A-Za-z][A-Za-z0-9_]{0,63}$`; others are renamed with a recorded mapping.
 - **SOCKS proxies** are not supported; only HTTP/HTTPS `CONNECT`.
 - **Token counts** use provider-reported values where present; otherwise input is priced from `contextUsagePercentage × context window`, output is estimated from emitted characters, and the usage is marked `estimated: true`.
+- **Enterprise model ids** have to be supplied (`modelIds`). The catalog only publishes friendly names and the enterprise data plane accepts an account-specific id; the service does not publish that mapping (the official CLI resolves it inside its native core), so it cannot be derived.
 
 ## Layout
 
@@ -181,6 +213,7 @@ lib/kiro-auth.js         credential read / refresh / multi-account store
 lib/kiro-transport.js    HTTPS with CONNECT-proxy egress
 lib/kiro-client.js       models, usage, profile ARN, multi-surface streaming
 lib/kiro-eventstream.js  vnd.amazon.eventstream frame decoder
+lib/kiro-runtime.js      Kiro runtime (Responses API): request + SSE + events
 lib/kiro-serialize.js    Harness messages -> wire request (+ size budget)
 lib/kiro-openai.js       OpenAI <-> Kiro
 lib/kiro-anthropic.js    Anthropic <-> Kiro
@@ -274,6 +307,35 @@ OIDC 注册固定带 Kiro 自己的身份中心 issuer。少了它，AWS 门户�
 | `api_key` | 不刷新 | `q.<region>.amazonaws.com` + `TokenType: API_KEY` |
 | `external_idp` | 自己的 token endpoint | `codewhisperer.<region>.amazonaws.com` + `TokenType: EXTERNAL_IDP` |
 
+### 企业账号（IAM 身份中心）
+
+企业账号走的数据面与个人账号不同，有三处差别。前两处插件自动处理，第三处需要一项设置。
+
+1. **客户端身份**：企业请求必须报 Kiro **CLI** 的身份（`KiroCLI/… app/AmazonQ-For-CLI
+   acp-client/kiro-cli`），不能报 IDE 的（`KiroIDE`）。带 IDE 身份时，服务端对每个模型
+   都回 `INVALID_MODEL_ID`。个人账号仍然报 IDE 身份，行为不变。
+2. **流量归因**：企业账号的 `userInputMessage.origin` 是 `KIRO_CLI`，个人账号是 `AI_EDITOR`。
+3. **模型 id**：公开目录只给友好名（`claude-opus-5.5`、`auto`……），企业账号的数据面却只认
+   另一套账号私有的 id。这份映射无法从服务端公开的任何东西推导出来（官方 CLI 是在自己的
+   native core 里解析的），只能由账号持有人提供：
+
+   ```yaml
+   modelIds:
+     claude-opus-5.5: CLAUDE_OPUS_5_5_V1_0
+   ```
+
+   上游回 `INVALID_MODEL_ID` / `model_not_found` 且映射没命中时，按 `modelIdProbe` 的顺序
+   试候选 id，第一个能用的会被记住（同一个友好名之后直接用它）：
+
+   ```yaml
+   modelIdProbe: [CLAUDE_OPUS_5_5_V1_0, CLAUDE_SONNET_4_5_20250929_V1_0]
+   ```
+
+   候选全部失败时，报的是上游原本的错误。
+
+profile ARN 用 `ListAvailableProfiles` 发现（POST 的**请求体是空对象**——服务端会拒
+`{"maxResults":50}`），并由它决定请求打到的区域。
+
 ## 在 Harness 之外使用
 
 设置页会给出 base URL 与生成的 key：
@@ -326,6 +388,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:PORT ANTHROPIC_API_KEY=kr-xxxx claude
 | `maxRequestChars` | `320000` | 单次请求的字符预算；超出时先丢最旧的整轮，再裁剪超长工具结果。 |
 | `autoContinue` | `true` | 只有 reasoning、没有可见内容时，自动再发一轮 `continue`。 |
 | `maxContinuations` | `2` | 自动续写的次数上限。 |
+| `modelIds` | 无 | `{ "<友好模型名>": "<上游认的 id>" }`。企业账号必须填：目录只给友好名，数据面认的是账号私有的一套 id。 |
+| `modelIdProbe` | 无 | 上游拒绝模型 id（`INVALID_MODEL_ID` / `model_not_found`）时按顺序试的候选 id；第一个能用的在内存里记住，全失败时报上游原本的错误。 |
+| `chatTransport` | `aws` | `aws` = CodeWhisperer eventstream；`kiro-runtime` = `runtime.<region>.kiro.dev/v1/responses`（OpenAI Responses API）。运行时是另一条数据面：请求契约是实测的，响应事件名**未**对活服务验证。 |
 
 ## 失败语义（全部来自实测）
 
@@ -389,6 +454,8 @@ import integrity 21 项
 - **SOCKS 代理**不支持，只支持 HTTP/HTTPS `CONNECT`。
 - **token 计数**优先用 provider 上报值；缺失时输入侧按 `contextUsagePercentage × 上下文窗口`
   定价、输出侧按字符数估算，并标 `estimated: true`。
+- **企业账号的模型 id 映射**要自己给（`modelIds`）：目录只公开友好名，企业数据面认的是
+  账号私有的一套 id，服务端不发布这份映射，官方 CLI 是在自己的 native core 里解析的。
 
 ## 目录
 
@@ -398,6 +465,7 @@ lib/kiro-auth.js         凭据读取 / 刷新 / 多账号
 lib/kiro-transport.js    HTTPS + CONNECT 代理
 lib/kiro-client.js       模型、用量、profile ARN、多数据面流
 lib/kiro-eventstream.js  vnd.amazon.eventstream 帧解码
+lib/kiro-runtime.js      Kiro 运行时（Responses API）：请求 + SSE + 事件
 lib/kiro-serialize.js    Harness 消息 -> wire 请求（含体积预算）
 lib/kiro-openai.js       OpenAI <-> Kiro
 lib/kiro-anthropic.js    Anthropic <-> Kiro

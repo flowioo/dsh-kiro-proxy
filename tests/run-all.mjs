@@ -28,6 +28,8 @@ const SUITES = [
   'fallback-test.mjs',
   'budget-test.mjs',
   'continue-test.mjs',
+  'idc-test.mjs',
+  'runtime-test.mjs',
   'proxy-e2e.mjs',
   'host-smoke.mjs',
   'ui-render-test.mjs',

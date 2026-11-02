@@ -574,12 +574,17 @@ let view
   if (builderRow) builderRow.props.onClick()
   view = await renderSettings()
 
-  // 整页只有连接配置卡的 4 个单行输入（外加 2 个模型勾选框）；登录表单不给 Builder ID 任何字段。
-  const textInputs = view.elements.filter(node => node && node.type === 'input'
-    && (node.props.type === 'text' || node.props.type === 'url' || node.props.type === 'password'))
-  const textareas = view.elements.filter(node => node && node.type === 'textarea')
-  check('Builder ID 表单无输入框', textInputs.length === 4 && textareas.length === 0,
-    `text inputs=${textInputs.length} textareas=${textareas.length}`)
+  // 登录表单本身不给 Builder ID 任何字段：所以整页的输入框数量不能比登录前多。
+  // （连接配置卡自己那几个输入框是页面的一部分，与登录方式无关。）
+  const countInputs = (rendered) => ({
+    text: rendered.elements.filter(node => node && node.type === 'input'
+      && (node.props.type === 'text' || node.props.type === 'url' || node.props.type === 'password')).length,
+    areas: rendered.elements.filter(node => node && node.type === 'textarea').length,
+  })
+  const baseInputs = countInputs(settings)
+  const formInputs = countInputs(view)
+  check('Builder ID 表单不增加输入框', formInputs.text === baseInputs.text && formInputs.areas === baseInputs.areas,
+    `text ${baseInputs.text}->${formInputs.text} areas ${baseInputs.areas}->${formInputs.areas}`)
   check('Builder ID 表单有「开始登录」', Boolean(findExactButton(view, '开始登录')))
   check('Builder ID 表单标题是方法名', view.blob.includes('AWS Builder ID'))
 

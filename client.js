@@ -149,6 +149,15 @@ window.__ModuleLoader__.load({
       maxContextWindow: 'Max context window (optional)',
       maxContextHint: 'Empty follows each model. A smaller number spends fewer tokens per turn.',
       maxContextInvalid: 'Enter a positive integer token count, or leave it empty.',
+      modelIds: 'Model id map (JSON, optional)',
+      modelIdsHint: 'Maps a friendly model name to the id the upstream accepts, e.g. {"claude-opus-5.5": "CLAUDE_OPUS_5_5"}. Enterprise accounts need this: the catalog only publishes friendly names.',
+      modelIdsInvalid: 'The model id map must be a JSON object of name to id.',
+      modelIdProbe: 'Model id probe list (optional)',
+      modelIdProbeHint: 'One candidate id per line. When the upstream refuses the model, they are tried in order and the first one that works is remembered.',
+      chatTransport: 'Chat transport',
+      chatTransportAws: 'AWS CodeWhisperer',
+      chatTransportRuntime: 'Kiro runtime (experimental)',
+      chatTransportHint: 'The Kiro runtime is a separate data plane with its own request contract; it is opt-in and unverified.',
 
       errors: 'Errors',
       quotaTitle: 'Kiro quota',
@@ -254,6 +263,15 @@ window.__ModuleLoader__.load({
       maxContextWindow: '最大上下文窗口（可选）',
       maxContextHint: '留空则跟随各模型；数值越小，每轮消耗的 token 越少。',
       maxContextInvalid: '请输入正整数 token 数，或留空。',
+      modelIds: '模型 id 映射（JSON，可选）',
+      modelIdsHint: '把友好模型名映射成上游真正认的 id，例如 {"claude-opus-5.5": "CLAUDE_OPUS_5_5"}。企业账号必须填：目录里只有友好名。',
+      modelIdsInvalid: '模型 id 映射必须是一个「名字 -> id」的 JSON 对象。',
+      modelIdProbe: '模型 id 探测列表（可选）',
+      modelIdProbeHint: '每行一个候选 id。上游拒绝模型 id 时按顺序尝试，第一个能用的会被记住。',
+      chatTransport: '聊天通道',
+      chatTransportAws: 'AWS CodeWhisperer',
+      chatTransportRuntime: 'Kiro 运行时（实验性）',
+      chatTransportHint: 'Kiro 运行时是另一条数据面，请求契约不同；默认关闭，且尚未对真实服务验证。',
 
       errors: '错误',
       quotaTitle: 'Kiro 配额',
@@ -540,7 +558,15 @@ a.dshkp-btn{text-decoration:none;display:inline-block}
       const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState('')
       const [copied, setCopied] = useState('')
-      const [draft, setDraft] = useState({ proxyUrl: '', region: '', profileArn: '', maxContextWindow: '' })
+      const [draft, setDraft] = useState({
+        proxyUrl: '',
+        region: '',
+        profileArn: '',
+        maxContextWindow: '',
+        modelIds: '',
+        modelIdProbe: '',
+        chatTransport: 'aws',
+      })
       // 登录流程：connectOpen=false 时整块不渲染；method 为空表示停在「选择登录方式」。
       const [connectOpen, setConnectOpen] = useState(false)
       const [method, setMethod] = useState('')
@@ -594,7 +620,15 @@ a.dshkp-btn{text-decoration:none;display:inline-block}
       // 只在配置真的变了的时候重置草稿，否则用户正在输入的内容会被轮询冲掉。
       const configKey = config === undefined
         ? ''
-        : JSON.stringify([config.proxyUrl ?? '', config.region ?? '', config.profileArn ?? '', config.maxContextWindow ?? ''])
+        : JSON.stringify([
+          config.proxyUrl ?? '',
+          config.region ?? '',
+          config.profileArn ?? '',
+          config.maxContextWindow ?? '',
+          config.modelIds === undefined || config.modelIds === null ? '' : JSON.stringify(config.modelIds),
+          Array.isArray(config.modelIdProbe) ? config.modelIdProbe.join('\n') : '',
+          config.chatTransport ?? 'aws',
+        ])
       useEffect(() => {
         if (config === undefined) return
         setDraft({
@@ -604,6 +638,13 @@ a.dshkp-btn{text-decoration:none;display:inline-block}
           maxContextWindow: config.maxContextWindow === undefined || config.maxContextWindow === null
             ? ''
             : String(config.maxContextWindow),
+          // 映射与探测列表是「配置」而不是「文本」：页面把它们渲染成可编辑的文本，
+          // 存回去时再解析回结构。
+          modelIds: config.modelIds === undefined || config.modelIds === null
+            ? ''
+            : JSON.stringify(config.modelIds, null, 2),
+          modelIdProbe: Array.isArray(config.modelIdProbe) ? config.modelIdProbe.join('\n') : '',
+          chatTransport: config.chatTransport === 'kiro-runtime' ? 'kiro-runtime' : 'aws',
         })
       }, [configKey])
 
@@ -722,12 +763,37 @@ a.dshkp-btn{text-decoration:none;display:inline-block}
           setError(t('maxContextInvalid'))
           return Promise.resolve(undefined)
         }
+        // 模型 id 映射是 JSON：解析不出来就停在这一步，别把坏配置存进去。
+        const mapText = String(draft.modelIds || '').trim()
+        let modelIds
+        if (mapText !== '') {
+          let parsed
+          try {
+            parsed = JSON.parse(mapText)
+          } catch {
+            parsed = undefined
+          }
+          const usable = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+            && Object.values(parsed).every(value => typeof value === 'string' && value.length > 0)
+          if (!usable) {
+            setError(t('modelIdsInvalid'))
+            return Promise.resolve(undefined)
+          }
+          modelIds = parsed
+        }
+        const probes = String(draft.modelIdProbe || '')
+          .split(/[\n,]+/u)
+          .map(item => item.trim())
+          .filter(item => item.length > 0)
         // 空字符串在 Host 侧等于“删掉这个键”（SettingsStore.merge 的语义）。
         const patch = {
           proxyUrl: draft.proxyUrl.trim(),
           region: draft.region.trim(),
           profileArn: draft.profileArn.trim(),
           maxContextWindow: raw === '' ? '' : Number(raw),
+          modelIds: modelIds === undefined ? '' : modelIds,
+          modelIdProbe: probes.length === 0 ? '' : probes,
+          chatTransport: draft.chatTransport === 'kiro-runtime' ? 'kiro-runtime' : 'aws',
         }
         return run('config', async () => {
           const body = await request('/settings', { method: 'POST', body: JSON.stringify(patch) })
@@ -895,6 +961,29 @@ a.dshkp-btn{text-decoration:none;display:inline-block}
             onChange: (event) => setDraft(current => ({ ...current, [name]: event.target.value })),
           }))
       }
+
+      // 多行输入：模型 id 映射（JSON）与探测列表都是一串一串的东西。
+      const areaField = (name, label, options) => {
+        const opts = options || {}
+        return h('label', { className: 'dshkp-field dshkp-field-wide', key: name },
+          h('span', null, label),
+          h('textarea', {
+            className: 'dshkp-input dshkp-textarea',
+            value: draft[name] === undefined ? '' : draft[name],
+            placeholder: opts.placeholder,
+            spellCheck: false,
+            onChange: (event) => setDraft(current => ({ ...current, [name]: event.target.value })),
+          }))
+      }
+
+      // 下拉：只有几个固定选项的地方（聊天通道）。
+      const selectField = (name, label, choices) => h('label', { className: 'dshkp-field', key: name },
+        h('span', null, label),
+        h('select', {
+          className: 'dshkp-input',
+          value: draft[name] === undefined ? choices[0].value : draft[name],
+          onChange: (event) => setDraft(current => ({ ...current, [name]: event.target.value })),
+        }, choices.map(choice => h('option', { key: choice.value, value: choice.value }, choice.label))))
 
       const connectField = (name, label, options) => {
         const opts = options || {}
@@ -1230,7 +1319,16 @@ a.dshkp-btn{text-decoration:none;display:inline-block}
             field('proxyUrl', t('proxyUrl'), { placeholder: 'http://127.0.0.1:7890' }),
             field('region', t('region'), { placeholder: 'us-east-1' }),
             field('profileArn', t('profileArn'), { wide: true, placeholder: 'arn:aws:codewhisperer:us-east-1:…:profile/…' }),
-            field('maxContextWindow', t('maxContextWindow'), { placeholder: '200000' })),
+            field('maxContextWindow', t('maxContextWindow'), { placeholder: '200000' }),
+            selectField('chatTransport', t('chatTransport'), [
+              { value: 'aws', label: t('chatTransportAws') },
+              { value: 'kiro-runtime', label: t('chatTransportRuntime') },
+            ])),
+          h('p', { className: 'dshkp-hint' }, t('chatTransportHint')),
+          areaField('modelIds', t('modelIds'), { placeholder: '{\n  "claude-opus-5.5": "…"\n}' }),
+          h('p', { className: 'dshkp-hint' }, t('modelIdsHint')),
+          areaField('modelIdProbe', t('modelIdProbe'), { placeholder: 'CLAUDE_OPUS_5_5_V1_0' }),
+          h('p', { className: 'dshkp-hint' }, t('modelIdProbeHint')),
           h('p', { className: 'dshkp-hint' }, t('maxContextHint'))))
 
       // ── 错误列表（Host 收集的模型/用量读取失败）──

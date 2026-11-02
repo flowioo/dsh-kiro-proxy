@@ -32,8 +32,15 @@
 }
 ```
 
-`UserInputMessage = { content, modelId, origin: 'AI_EDITOR', userInputMessageContext?: { tools?, toolResults? }, images? }`
+`UserInputMessage = { content, modelId, origin, userInputMessageContext?: { tools?, toolResults? }, images? }`
 `AssistantResponseMessage = { content, toolUses?: { toolUseId, name, input }[] }`
+
+`origin` 跟着账号走：个人账号（builder-id / google / github / social / imported / api_key）
+是 `AI_EDITOR`，企业账号（`idc` / `external_idp`）是 `KIRO_CLI`——企业账号走的是 Kiro CLI
+那一侧的数据面，带 IDE 的归因会被拒。
+
+`modelId` 也可能与目录里的友好名不同：企业账号的数据面只认账号私有的一套 id，
+友好名到 wire id 的映射由 `modelIds` 设置提供（见第 5 节）。
 
 响应：`content-type: application/vnd.amazon.eventstream`，逐帧：
 
@@ -56,11 +63,47 @@ payload 事件（`headers[':event-type']` 或 `:exception-type`）：
 
 公共头：`authorization: Bearer <accessToken>`、`content-type: application/json`、
 `accept: application/vnd.amazon.eventstream`、`x-amzn-kiro-agent-mode: vibe`、
-`user-agent` 与 `x-amz-user-agent` 均为 `aws-sdk-js/3.738.0 KiroIDE`（Kiro 按 UA 授权）、
 `x-amzn-codewhisperer-optout: true`、`Amz-Sdk-Request: attempt=1; max=3`、
 `Amz-Sdk-Invocation-Id: <uuid>`、`x-amzn-codewhisperer-machine-id: kiro-desktop`；
 api_key 追加 `TokenType: API_KEY`，external_idp 追加 `TokenType: EXTERNAL_IDP`；
 有 profileArn 时追加 `x-amzn-codewhisperer-profile-arn`。
+
+`user-agent` 与 `x-amz-user-agent` 按账号分派（Kiro 按客户端身份授权，不是按归因）：
+
+| authMethod | user-agent |
+| --- | --- |
+| `idc` / `external_idp` | `KiroCLI/2.34.2 KAS/0.66.62 os/<platform> md/appVersion-2.34.2 app/AmazonQ-For-CLI acp-client/kiro-cli` |
+| 其他 | `aws-sdk-js/3.738.0 KiroIDE` |
+
+实测：带 IDE 的 UA 时，企业账号的聊天请求回 `INVALID_MODEL_ID`；带 CLI 的 UA 时，
+同一个请求回 `profileArn is required for this request.`——说明企业账号只有走 CLI
+那条路才会被当成企业流量。
+
+`ListAvailableProfiles`（POST）的请求体必须是 `{}`：带 `{"maxResults":50}` 会回
+`400 REQUEST_BODY_INVALID`，那样 profile ARN 永远解析不出来。
+
+## 1b. Kiro 运行时通道（可选，未对活服务验证）
+
+`chatTransport: 'kiro-runtime'` 时聊天改走 `https://runtime.<region>.kiro.dev/v1/responses`
+（POST，OpenAI Responses API）。实测的请求契约：
+
+```
+{ model, input, profileArn, origin: 'KIRO_CLI', stream: true }
+```
+
+- 缺 `profileArn` -> `profileArn is required for this request.`
+- 缺 `stream` -> `Non-streaming responses are not supported for this request. Please set stream=true.`
+- 缺 `origin` -> `origin is required unless the request carries the Kiro Reasoning service principal`
+- 模型 id 不被接受 -> `Invalid model ID: <id>`，`code: model_not_found`
+
+响应是 `text/event-stream`，OpenAI Responses 事件帧
+（`response.output_text.delta`、`response.reasoning_text.delta`、
+`response.output_item.added`、`response.function_call_arguments.delta`、
+`response.output_item.done`、`response.completed` / `response.failed`），
+由 `lib/kiro-runtime.js` 翻译成第 4 节的内部事件词汇。
+
+**状态：请求契约是实测的；响应事件名是按 OpenAI Responses 的公开形状实现的，
+没有对活服务验证过。** 默认关闭（`chatTransport` 默认 `aws`）。
 
 ## 2. 模块边界
 
@@ -71,6 +114,7 @@ lib/kiro-transport.js   post/get + CONNECT 代理 + JSON 帮助函数        [Le
 lib/kiro-auth.js        凭据读取/刷新/多账号                           [Lead]
 lib/kiro-client.js      KiroClient：models()/usage()/stream()/profile() [Lead]
 lib/kiro-eventstream.js decodeFrames(stream) -> AsyncIterable<Frame>  [wire]
+lib/kiro-runtime.js     Kiro 运行时：请求拼装 + SSE 解码 + 事件归一化    [wire]
 lib/kiro-serialize.js   Harness GenerateOptions -> WireRequest        [wire]
 lib/kiro-openai.js      OpenAI chat.completions <-> Kiro              [translate]
 lib/kiro-anthropic.js   Anthropic messages <-> Kiro                   [translate]
@@ -193,7 +237,13 @@ Host 挂在 `webServer`：
 - `POST /kiro-proxy/api/accounts/use` `{ id }` -> 切换活动账号
 - `POST /kiro-proxy/api/accounts/import` `{ json | refreshToken | apiKey, label? }`
 - `POST /kiro-proxy/api/accounts/remove` `{ id }`
-- `POST /kiro-proxy/api/settings` `{ proxyUrl?, region?, profileArn?, maxContextWindow?, enabledModels? }`
+- `POST /kiro-proxy/api/settings` `{ proxyUrl?, region?, profileArn?, maxContextWindow?, enabledModels?, modelIds?, modelIdProbe?, chatTransport? }`
+  - `modelIds`: `{ "<友好模型名>": "<上游真正认的 id>" }`。目录只给友好名，企业账号的
+    数据面却只认账号私有的一套 id；这份映射只能由账号持有人提供。
+  - `modelIdProbe`: `string[]`。上游回 `INVALID_MODEL_ID` / `model_not_found` 时按顺序
+    试这些候选 id，第一个能用的在内存里记住（同一个友好名之后直接用它）。
+    全部失败时报的是上游原本的错误，不换错误码、不换措辞。
+  - `chatTransport`: `'aws'`（默认，CodeWhisperer eventstream）或 `'kiro-runtime'`（第 1b 节）。
 - `POST /kiro-proxy/api/login/start` `{ method, region?, startUrl?, label?, secret?, json? }` -> `{ ok, value: LoginView, status?, accountId? }`
   - `method`: `builder-id` | `idc` | `google` | `github` | `refresh-token` | `api-key` | `external-idp`
   - `builder-id` / `idc` 走 AWS OIDC 设备码（`client/register` → `device_authorization` → 轮询 `token`），
@@ -217,7 +267,7 @@ Host 挂在 `webServer`：
   enabledModels: string[],
   usage: { plan, rows: [{ label, used, limit, resetAt? }], fetchedAt } | null,
   proxy: { baseUrl, key: string, openaiBaseUrl, anthropicBaseUrl, enabled },
-  config: { proxyUrl, region, profileArn, maxContextWindow },
+  config: { proxyUrl, region, profileArn, maxContextWindow, modelIds, modelIdProbe, chatTransport },
   errors: string[],
 }`
 
